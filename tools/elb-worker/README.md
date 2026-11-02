@@ -1,8 +1,12 @@
-# Experimental stdio inference worker (no HTTP, no Qt)
+# Experimental asynchronous stdio worker (no HTTP, no Qt)
 
-This standalone CMake entry point adds llama-worker without changing llama-server.
-The model is loaded once. Requests are sequential and stateless; a context is
-allocated per chat and released afterwards. History must be supplied by the client.
+The model is loaded once. stdin is read by the main thread; chat jobs enter a
+bounded FIFO queue and run in a fixed thread pool. Each running job owns its
+context, KV cache, batch and sampler. CPU model weights are shared. Context
+initialization is serialized; prefill and decoding are not. Contexts are released
+per request; history must be supplied by the client. This is independent-context
+concurrency, not continuous batching. Validate the shared CPU backend on your
+actual deployment before production; concurrent inference has not been tested here.
 
 ## Build
 
@@ -11,71 +15,84 @@ From the repository root, using a recent CMake and C++17 compiler:
 ```sh
 cmake -S tools/elb-worker -B build/elb-worker \
   -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
-  -DGGML_CPU_ALL_VARIANTS=OFF \
-  -DGGML_SSE42=ON -DGGML_BMI2=OFF \
+  -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_SSE42=ON -DGGML_BMI2=OFF \
   -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_AVX512=OFF \
   -DGGML_FMA=OFF -DGGML_F16C=OFF
 cmake --build build/elb-worker --target llama-worker -j4
-cmake --install build/elb-worker --prefix "$PWD/runtime" --component Unspecified
+mkdir -p runtime/bin logs
+cp build/elb-worker/llama-worker runtime/bin/
 ```
 
-Alternatively copy the built executable from build/elb-worker/llama-worker to
-runtime/bin. Inspect ldd before packaging: BUILD_SHARED_LIBS=OFF does not mean a
-fully static binary. Do not bundle glibc casually. SSE4.2 still needs to be present
-on the destination CPU. CentOS 7 build/runtime compatibility has NOT been tested.
-The code targets the batch_ext/process API of this fork, not older llama releases.
+The existing target links llama, which carries the platform thread dependency.
+Inspect ldd before packaging; this is not a fully static executable. Do not copy
+glibc into the project casually. SSE4.2 must be available on the destination CPU.
+Use the project-local CMake and devtoolset GCC on CentOS 7 as before.
 
 ## Run
 
 ```sh
-./runtime/bin/llama-worker ./models/current.gguf 4096 8 2>./logs/worker.log
+./runtime/bin/llama-worker ./models/current.gguf 4096 4 2 16 2>./logs/worker.log
 ```
 
-Create logs inside the deployment directory first. stdout is NDJSON only; stderr
-is diagnostics. Read BOTH pipes concurrently in a parent process. Do not launch a
-new worker per request. EOF on stdin shuts the worker down after the active request.
+Arguments: MODEL [CTX=4096] [THREADS_PER_JOB=4] [WORKERS=1] [QUEUE=16].
+Old invocations remain valid with one generator, but stdin is now asynchronous.
+WORKERS range: 1..16. QUEUE range: 1..256, counts waiting jobs only.
+For an 8-vCPU VM start with 2 workers and 4 threads per job. This is not a CPU
+quota; backend/helper threads also exist. More jobs need more KV/scratch memory
+and may increase latency instead of improving aggregate throughput.
 
-Example input lines:
+## Protocol v1 (NDJSON)
+
+Each input/output is one JSON line, at most 1 MiB for input. Stdout writes are
+mutex-protected and flushed per complete line. Read stderr independently. IDs
+must be nonempty strings of at most 128 bytes. Use unique IDs for ALL requests.
+Pending/active duplicate chat IDs are rejected, not replayed or deduplicated
+across restarts. Reusing an active ID creates ambiguous error correlation, so
+clients must never do so. IDs are released just after the terminal output write.
 
 ```json
-{"version":1,"type":"ping","request_id":"p1"}
-{"version":1,"type":"chat","request_id":"c1","messages":[{"role":"user","content":"Explain RAII briefly. /no_think"}],"max_tokens":128,"temperature":0.2}
+{"version":1,"type":"chat","request_id":"A","stream":true,"messages":[{"role":"user","content":"List five C++ features. /no_think"}],"max_tokens":160,"temperature":0.2}
+{"version":1,"type":"chat","request_id":"B","stream":true,"messages":[{"role":"user","content":"List five Linux commands. /no_think"}],"max_tokens":160,"temperature":0.2}
+{"version":1,"type":"ping","request_id":"P"}
 ```
 
-The worker emits ready after loading, pong for ping and result/error for each
-request. Results include request_id, answer, finish_reason and usage. Error lines
-are recoverable; a fatal startup error is written to stderr with a nonzero exit.
-Input lines are limited to 1 MiB, messages to 128, max_tokens to 4096. Oversized
-lines are drained without retaining excess bytes. Empty lines are ignored.
+Events:
+- ready: model loaded and pool created; includes workers/threads_per_job/queue_capacity.
+- started: job dequeued; includes request_id, zero-based slot, elapsed_ms from pool creation.
+  This marks dispatch, NOT the first model token. Allocation and prefill follow.
+- delta: request_id, zero-based index, content; only for stream:true. UTF-8 may
+  span tokens, so a delta can combine tokens. Incomplete final UTF-8 returns error.
+- result: terminal success, full answer, finish_reason and usage. Do NOT append
+  answer again if you already displayed deltas. finish_reason:length is truncation.
+- error: terminal rejection/failure, error.code and error.message. Partial deltas
+  may precede a generation failure; discard/mark the partial answer as incomplete.
+- pong: handled by the reader, without waiting for inference or a free worker.
 
-## Template/thinking limitations
+If the waiting queue is full, a new chat gets error.code=busy. Admission timing
+is scheduler-dependent: a burst can fill the queue before idle workers dequeue.
+There is no queued acknowledgement. Ordering between different IDs is undefined;
+within a job, started precedes deltas and exactly one normal terminal result/error.
+On EOF, accepted jobs are drained and all threads joined before model destruction.
+A slow/full stdout pipe applies backpressure to all output, including pong. This
+is not a real-time ping guarantee. Keep reading outputs while sending inputs.
 
-messages use llama_chat_apply_template with the model's built-in template. This
-is NOT the server's complete Jinja/chat-template engine. Unsupported templates
-return errors. As an escape hatch, pass prompt containing a fully formatted model
-prompt instead of messages. No role markup or model-specific template is invented.
-For Qwen3 /no_think is only a soft instruction. enable_thinking and
-chat_template_kwargs are deliberately rejected rather than silently ignored.
-The answer may contain reasoning tags; there is no server-style reasoning parser.
-No tool calling, vision, streaming, cancellation, deadlines, deduplication, prefix
-cache or parallel requests are implemented in v1. Use only decoder-only text GGUFs.
-A malformed model/backend failure may require restarting the worker.
+## Limits and integration
 
-## Main application integration contract
+No HTTP listener or broker connection is created. messages use the built-in
+llama_chat_apply_template, NOT full Jinja. Unsupported templates return errors;
+use a fully formatted prompt as an escape hatch. Thinking kwargs are rejected.
+/no_think is only a model instruction; think tags are not removed or parsed.
+No cancellation, per-job deadline, vision, tools, persistent sessions, durable
+queue, ActiveMQ adapter or HTTP adapter is implemented. The ILlmTransport header
+remains an interface sketch; AiElbHelper has not been changed by this commit.
+A broken stdout/SIGPIPE or fatal backend failure may terminate the process.
+Untrusted workloads should be isolated/limited by the parent application.
 
-illmtransport.h is a dependency-free interface sketch, NOT a ready-made process
-or HTTP client. Its exchange method carries the same request/result envelopes.
-Implement ProcessLlmTransport (fork/exec with separate pipes, NOT shell commands),
-HttpLlmTransport (map envelopes to /v1/chat/completions), and optionally an ActiveMQ
-adapter in AiElbHelper. No files in AiElbHelper are changed by this commit.
+## Validation required
 
-The parent must serialize exchanges, validate matching request_id, bound replies,
-read stderr, enforce deadlines and restart on crash. A timeout alone does not stop
-inference. Until cancellation exists, terminate/restart the worker to abort. Do
-not blindly replay timed-out requests. For ActiveMQ, define reply destinations,
-correlation IDs, acknowledgements and redelivery/deduplication explicitly.
-
-This implementation is uncompiled and untested in the GitHub tool environment.
-Before production test: two chats in one process; malformed JSON followed by ping;
-oversized line followed by ping; context overflow; EOF; unavailable model; pipe
-closure; and runtime dependencies/CPU flags on the actual CentOS 7 target.
+This change has not been compiled or benchmarked in the tool environment.
+Test A/B streaming with WORKERS=2: both started events before the first result;
+look for overlapping first-delta to terminal intervals, not just started events.
+Also test immediate ping, malformed JSON, overflow, queue saturation (busy),
+duplicate active IDs, non-streaming, EOF drain, failed model load and closed pipes.
+Measure RSS and compare throughput/latency for 1x8 versus 2x4 threads on your VM.
