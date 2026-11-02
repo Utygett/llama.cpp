@@ -76,6 +76,7 @@ std::string format_prompt(llama_model * model, const json & request) {
     return std::string(output.data(), n);
 }
 json generate(llama_model * model, const json & request, int ctx_size, int threads) {
+    const bool streaming = request.value("stream", false);
     const int limit = request.value("max_tokens", 256);
     const double temp = request.value("temperature", 0.2);
     if (limit < 1 || limit > 4096 || !std::isfinite(temp) || temp < 0 || temp > 2)
@@ -117,6 +118,8 @@ json generate(llama_model * model, const json & request, int ctx_size, int threa
         llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     }
     std::string answer, reason = "length";
+    std::string pending_utf8;
+    int delta_index = 0;
     int generated = 0;
     for (int i = 0; i < limit; ++i) {
         const auto token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
@@ -129,9 +132,41 @@ json generate(llama_model * model, const json & request, int ctx_size, int threa
         }
         if (n < 0) throw std::runtime_error("detokenization failed");
         answer.append(piece.data(), n);
+
+        if (streaming) {
+            pending_utf8.append(piece.data(), n);
+
+            // A token can contain only part of a UTF-8 character.
+            // Emit only when the accumulated fragment is valid UTF-8.
+            bool valid_utf8 = true;
+            try {
+                const auto checked = json(pending_utf8).dump();
+                (void) checked;
+            } catch (const json::type_error &) {
+                valid_utf8 = false;
+            }
+
+            if (valid_utf8 && !pending_utf8.empty()) {
+                emit({
+                    {"version", 1},
+                    {"type", "delta"},
+                    {"request_id", request.at("request_id")},
+                    {"index", delta_index++},
+                    {"content", pending_utf8}
+                });
+                pending_utf8.clear();
+            }
+        }
+
         ++generated;
         if (i + 1 < limit) evaluate(ctx.get(), batch.get(), &token, 1, needed + i);
     }
+    if (streaming && !pending_utf8.empty()) {
+        throw std::runtime_error(
+            "generation ended with an incomplete or invalid UTF-8 fragment"
+        );
+    }
+
     return {{"version", 1}, {"type", "result"}, {"success", true},
         {"request_id", request.at("request_id")}, {"answer", answer}, {"finish_reason", reason},
         {"usage", {{"prompt_tokens", needed}, {"completion_tokens", generated}, {"total_tokens", needed + generated}}}};
